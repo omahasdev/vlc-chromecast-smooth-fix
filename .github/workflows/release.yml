@@ -1,0 +1,96 @@
+# Build libchromecast_smooth_fix_plugin.dll for one VLC 3.0.x version and
+# publish it as a GitHub Release with its SHA-256, the corresponding source,
+# and a build provenance attestation. Start it from the Actions tab
+# (Run workflow).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      vlc_version:
+        description: VLC 3.0.x version (for example 3.0.24)
+        required: true
+        default: "3.0.24"
+
+permissions:
+  contents: write       # create the release
+  id-token: write       # sign the attestation
+  attestations: write
+
+jobs:
+  build:
+    runs-on: windows-2025
+    env:
+      VLC_VERSION: ${{ inputs.vlc_version }}
+      PLUGIN: libchromecast_smooth_fix_plugin.dll
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Check the version
+        shell: bash
+        run: |
+          echo "$VLC_VERSION" | grep -Eq '^3\.0\.[0-9]+$' || { echo "not a VLC 3.0.x version: $VLC_VERSION"; exit 1; }
+
+      - name: Build
+        shell: bash
+        env:
+          VLC_CHROMECAST_SMOOTH_FIX_WORK: ${{ runner.temp }}\work
+        run: sh scripts/vlc-chromecast-smooth-fix.sh build "$VLC_VERSION"
+
+      - name: Collect the release files
+        shell: bash
+        env:
+          WORK: ${{ runner.temp }}\work
+        run: |
+          set -e
+          work=$(cygpath -u "$WORK")
+          dist=dist
+          mkdir -p "$dist/source"
+          cp "$work/out/$VLC_VERSION/$PLUGIN" "$dist/"
+          (cd "$dist" && sha256sum "$PLUGIN" > "$PLUGIN.sha256")
+          # the corresponding source of the DLL (LGPL-2.1-or-later)
+          cp -r src build scripts LICENSE README.md "$dist/source/"
+          /c/Windows/System32/tar.exe -a -c -f "$dist/vlc-chromecast-smooth-fix-$VLC_VERSION-source.zip" -C "$dist/source" .
+          cat "$dist/$PLUGIN.sha256"
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ env.PLUGIN }}
+
+      - name: Publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag="vlc-$VLC_VERSION"
+          sha=$(cut -d' ' -f1 "dist/$PLUGIN.sha256")
+          cat > notes.md <<EOF
+          \`$PLUGIN\` for **VLC $VLC_VERSION, 64-bit**. It fixes Chromecast output: dropped frames of
+          remuxed files, slow x264 encoding (NVENC on NVIDIA GPUs), slow GPU decoding in conversions,
+          5.1 audio after a seek, and the aspect ratio of wide videos. See the [README](https://github.com/$GITHUB_REPOSITORY#readme).
+
+          SHA-256: \`$sha\`
+
+          Install:
+          1. Close VLC.
+          2. Copy \`$PLUGIN\` to \`C:\\Program Files\\VideoLAN\\VLC\\plugins\\codec\\\`.
+          3. If \`libnvenc_plugin.dll\` (an older version of this plugin) is in the same folder, delete it.
+          4. As administrator, run \`"C:\\Program Files\\VideoLAN\\VLC\\vlc-cache-gen.exe" "C:\\Program Files\\VideoLAN\\VLC\\plugins"\`.
+          5. In **Tools > Preferences > All > Stream output > Sout stream > Chromecast**, set **Conversion quality** to **High**.
+
+          To remove it, delete the file and run step 4 again.
+
+          Verify that this repository built the file:
+          \`gh attestation verify $PLUGIN --repo $GITHUB_REPOSITORY\`
+
+          The same build from this commit with \`install.cmd\` gives the same SHA-256.
+          \`vlc-chromecast-smooth-fix-$VLC_VERSION-source.zip\` holds the corresponding source.
+          EOF
+          files="dist/$PLUGIN dist/$PLUGIN.sha256 dist/vlc-chromecast-smooth-fix-$VLC_VERSION-source.zip"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" --clobber $files
+            gh release edit "$tag" --notes-file notes.md
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "VLC $VLC_VERSION Chromecast smooth fix" --notes-file notes.md $files
+          fi
